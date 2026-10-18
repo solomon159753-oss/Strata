@@ -27,6 +27,10 @@
 #include <cstring>
 #include <deque>
 #include <fstream>
+#include <future>
+#include <system_error>
+#include <condition_variable>
+#include <utility>
 #include <filesystem>
 #include <sstream>
 #include <limits>
@@ -3677,6 +3681,42 @@ int tail_skip_rank() {
 }
 void set_tail_skip_rank(int r) { g_tail_skip_rank.store(r > 0 && r < 10 ? r : 0, std::memory_order_relaxed); }
 
+namespace {
+// One persistent reader per dispatching host thread. File IO keeps its aligned
+// scratch and events on this reader instead of recreating them each layer.
+class Round4CpuIoWorker {
+    std::mutex mu_;
+    std::condition_variable cv_;
+    std::packaged_task<void()> pending_;
+    bool stop_=false;
+    std::thread thread_;
+    void loop() {
+        for(;;) {
+            std::packaged_task<void()> task;
+            {
+                std::unique_lock<std::mutex> lock(mu_);
+                cv_.wait(lock,[this]{return stop_ || pending_.valid();});
+                if(stop_ && !pending_.valid()) return;
+                task=std::move(pending_);
+            }
+            task();
+        }
+    }
+public:
+    Round4CpuIoWorker():thread_([this]{loop();}) {}
+    ~Round4CpuIoWorker() {
+        {std::lock_guard<std::mutex> lock(mu_);stop_=true;}
+        cv_.notify_one();thread_.join();
+    }
+    template<class F> std::future<void> submit(F&& f) {
+        std::packaged_task<void()> task(std::forward<F>(f));
+        auto done=task.get_future();
+        {std::lock_guard<std::mutex> lock(mu_);pending_=std::move(task);}
+        cv_.notify_one();return done;
+    }
+};
+} // namespace
+
 void expert_pool_dispatch_multi(ExpertDispatch& d, const float* x_f, const int32_t* ids, int64_t n_tok, int64_t k,
                                 float* out) {
     using namespace strata::kernels::cpu;
@@ -3901,6 +3941,19 @@ void expert_pool_dispatch_multi(ExpertDispatch& d, const float* x_f, const int32
         }
     }
     const auto c2 = std::chrono::steady_clock::now();
+    // R4: one layer's RAM jobs may compute while its file jobs are prefetched.
+    // The opt-in path joins the IO task before handing out file pointers, and
+    // before any return. The source and staging storage outlive both groups.
+    static const bool cpu_io_opt = [] { const char* e=std::getenv("STRATA_CPU_IO_OVERLAP"); return e && std::strcmp(e,"1")==0; }();
+    auto* cpu_io_file = cpu_io_opt ? dynamic_cast<FileExpertSource*>(d.src) : nullptr;
+    bool cpu_io_active = false;
+    std::chrono::steady_clock::time_point cpu_io_begin{},cpu_io_end{};
+    std::future<void> cpu_io_task;
+    // packaged_task futures do not implicitly join; retain the source on every
+    // error return too, just as on the ordinary successful path.
+    struct CpuIoJoin {std::future<void>& task;~CpuIoJoin(){if(task.valid())task.wait();}} cpu_io_join{cpu_io_task};
+    static thread_local std::unique_ptr<Round4CpuIoWorker> cpu_io_worker;
+    static thread_local std::vector<int64_t> cpu_io_experts;
     if (any_cpu) {   // CS-T: the experts the CPU computes, fetched together (the GGUF in place reads them on several threads)
         static thread_local std::vector<int64_t> miss;
         miss.clear();
@@ -3908,7 +3961,33 @@ void expert_pool_dispatch_multi(ExpertDispatch& d, const float* x_f, const int32
             if (kind[i] == -1 && ids[i] >= 0 && ids[i] < d.n_expert &&
                 std::find(miss.begin(), miss.end(), (int64_t) ids[i]) == miss.end())
                 miss.push_back(ids[i]);
-        d.src->prefetch(d.layers, miss.data(), (int64_t) miss.size());
+        // No helper GPU, Foresight, or adaptive overlap in this first version.
+        // resident_blob() is a documented read-only, any-thread lookup.
+        const char* ao=std::getenv("STRATA_ADAPT_OVERLAP");
+        if (cpu_io_file && native && cpu_io_file->complement_ready() &&
+            d.remote_count==0 && d.peer==nullptr && d.fs==nullptr && !(ao && ao[0]=='1')) {
+            int ram=0, file=0;
+            for (int64_t e : miss) {
+                if(cpu_io_file->resident_blob(d.layers,e)) ++ram; else ++file;
+            }
+            cpu_io_active=ram>0 && file>0;
+            if(cpu_io_active) {
+                cpu_io_experts.assign((size_t)(n_tok*k),-1);
+                try {
+                    if(!cpu_io_worker) cpu_io_worker=std::make_unique<Round4CpuIoWorker>();
+                    cpu_io_task=cpu_io_worker->submit([src=d.src,layer=d.layers,ids=miss,&cpu_io_begin,&cpu_io_end] {
+                        cpu_io_begin=std::chrono::steady_clock::now();
+                        src->prefetch(layer,ids.data(),(int64_t)ids.size());
+                        cpu_io_end=std::chrono::steady_clock::now();
+                    });
+                } catch(const std::system_error&) { cpu_io_active=false; }
+                if(cpu_io_active) {
+                    static std::atomic<bool> printed{false};
+                    if(!printed.exchange(true)) std::fprintf(stderr,"strata CPU/io overlap: active; RAM jobs beside expert prefetch (same per-expert token groups)\n");
+                }
+            }
+        }
+        if(!cpu_io_active) d.src->prefetch(d.layers, miss.data(), (int64_t) miss.size());
     }
     int njobs = 0;
     for (int64_t t = 0; t < n_tok; ++t)
@@ -3942,8 +4021,9 @@ void expert_pool_dispatch_multi(ExpertDispatch& d, const float* x_f, const int32
             ++d.cache_refused;
             int16_t& jo = d.job_of[(size_t) e];
             if (jo < 0) {
-                const uint8_t* b = d.src->blob(d.layers, e);
-                if (b == nullptr) {
+                const bool deferred=cpu_io_active && cpu_io_file->resident_blob(d.layers,e)==nullptr;
+                const uint8_t* b = deferred ? nullptr : d.src->blob(d.layers, e);
+                if (b == nullptr && !deferred) {
                     d.failed = true;
                     d.fail = "the expert source could not produce a blob";
                     d.fail_layer = d.layers;
@@ -3952,6 +4032,7 @@ void expert_pool_dispatch_multi(ExpertDispatch& d, const float* x_f, const int32
                     return;
                 }
                 jo = (int16_t) njobs++;
+                if(cpu_io_active) cpu_io_experts[(size_t)jo]=e;
                 ExpertJobMulti& nj = d.jobs_multi[(size_t) jo];
                 nj.blob = b;
                 nj.nt = 0;
@@ -3966,9 +4047,41 @@ void expert_pool_dispatch_multi(ExpertDispatch& d, const float* x_f, const int32
     const auto c3 = std::chrono::steady_clock::now();
     pt("run", njobs);
     if (njobs > 0) {
-        if (native) d.pool->run_split_multi_native(lay.fmt[(size_t) d.layers], d.jobs_multi.data(), njobs);
+        if(cpu_io_active) {
+            static thread_local std::vector<ExpertJobMulti> ready, disk;
+            static thread_local std::vector<int64_t> disk_ids;
+            ready.clear();disk.clear();disk_ids.clear();
+            for(int j=0;j<njobs;++j) {
+                const auto& jb=d.jobs_multi[(size_t)j];
+                if(jb.blob) ready.push_back(jb);
+                else {disk.push_back(jb);disk_ids.push_back(cpu_io_experts[(size_t)j]);}
+            }
+            // Only the scheduling changes. Each expert keeps its full token
+            // group, activation pointers and independent output rows unchanged.
+            const auto ready_begin=std::chrono::steady_clock::now();
+            if(!ready.empty()) d.pool->run_split_multi_native(lay.fmt[(size_t)d.layers],ready.data(),(int)ready.size());
+            const auto ready_end=std::chrono::steady_clock::now();
+            cpu_io_task.get();
+            const auto joined=std::chrono::steady_clock::now();
+            auto elapsed=[](auto a,auto b){return std::chrono::duration<double,std::milli>(b-a).count();};
+            struct IoCpuStats {uint64_t n=0;double io=0,ready=0,overlap=0,wait=0;};
+            static thread_local IoCpuStats stats;
+            ++stats.n;stats.io+=elapsed(cpu_io_begin,cpu_io_end);stats.ready+=elapsed(ready_begin,ready_end);
+            stats.overlap+=std::max(0.0,elapsed(std::max(cpu_io_begin,ready_begin),std::min(cpu_io_end,ready_end)));
+            stats.wait+=elapsed(ready_end,joined);
+            if(stats.n==1 || stats.n%512==0)
+                std::fprintf(stderr,"strata CPU/io overlap sample: %llu calls, io %.3f readyCPU %.3f overlap %.3f joinwait %.3f ms/call (cumulative)\n",(unsigned long long)stats.n,stats.io/stats.n,stats.ready/stats.n,stats.overlap/stats.n,stats.wait/stats.n);
+            for(size_t j=0;j<disk.size();++j) {
+                disk[j].blob=d.src->blob(d.layers,disk_ids[j]);
+                if(!disk[j].blob) {
+                    d.failed=true;d.fail="CPU/io overlap: expert read failed";d.fail_layer=d.layers;d.fail_expert=disk_ids[j];++d.missing;return;
+                }
+            }
+            if(!disk.empty()) d.pool->run_split_multi_native(lay.fmt[(size_t)d.layers],disk.data(),(int)disk.size());
+        } else if (native) d.pool->run_split_multi_native(lay.fmt[(size_t) d.layers], d.jobs_multi.data(), njobs);
         else d.pool->run_split_multi(d.jobs_multi.data(), njobs);
     }
+    if(cpu_io_task.valid()) cpu_io_task.get();
     if (d.remote_count > 0) {
         static thread_local std::string remote_error;
         for (int r = 0; r < d.remote_count; ++r)
