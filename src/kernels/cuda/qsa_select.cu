@@ -1123,6 +1123,22 @@ bool qsa_block_scores_tc(const float* pooled, const float* dead, const float* q_
     if (nq <= 0) return true;
     if (s.idx_dim != IDX_DIM || s.idx_n_head != IDX_HEADS || s.idx_block != R || nq > 65535 * TC_QT) return false;
 #if defined(__HIPCC__)
+    // Local opt-in HIP port of the existing FP32 tiled scorer. Default dispatch is unchanged.
+    static const bool simt_on = [] {
+        const char* v = std::getenv("STRATA_SELECT_SIMT"); return v && v[0] == '1';
+    }();
+    if (simt_on) {
+        const int64_t reach = active_blocks > 0 && active_blocks < max_blocks ? active_blocks : max_blocks;
+        const dim3 grid((unsigned)((reach + SM_NB - 1) / SM_NB), (unsigned)((nq + SM_QT - 1) / SM_QT));
+        if (grid.y > 65535) return false;
+        static bool said = false;
+        if (!said) { std::fprintf(stderr, "strata: HIP FP32 tiled selector on (STRATA_SELECT_SIMT=1)\n"); said = true; }
+        block_scores_simt_kernel<<<grid,256,0,(cudaStream_t)stream>>>(pooled,q_idx,steps,nq,max_blocks,reach,scores);
+        block_scores_tail_kernel<<<(unsigned)nq,32,0,(cudaStream_t)stream>>>(dead,q_idx,steps,max_blocks,scores);
+        const cudaError_t e = cudaGetLastError();
+        if (e != cudaSuccess) { std::fprintf(stderr,"qsa_block_scores HIP simt: %s\n",cudaGetErrorString(e)); std::exit(1); }
+        return true;
+    }
     // AMD: the gfx12 (RDNA4) WMMA scorer, opt-in (STRATA_SELECT_WMMA=1): it selects slightly differently from the warp
     // kernel (254/256 queries the same), so the default keeps the warp kernel; every other target keeps it too (false)
     static const bool wmma_on = [] {

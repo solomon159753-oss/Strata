@@ -5,6 +5,7 @@
 #define STRATA_ATOMIC_WAIT 1   // #1488: std::atomic::wait / notify_all are a GCC 11 library feature; GCC 10 spins instead
 #endif
 #include "mmq_resident_sort.hpp"
+#include "compact_mmq_plan.hpp"
 #include "wmma_gemm.h"
 #include "strata/core/mtp.hpp"
 #include "strata/core/pinned_ring.hpp"
@@ -799,6 +800,10 @@ struct Prefill::Impl {
     void *Xq = nullptr, *Hq = nullptr;
     float* H = nullptr;
     int32_t *ids_identity = nullptr, *bounds_dev = nullptr;
+    int32_t* compact_gu_ids = nullptr;
+    bool compact_mmq = false;
+    std::vector<int32_t> compact_gu_host;
+    std::vector<compact::Group> compact_groups;
     uint8_t *grp_gu = nullptr, *grp_d = nullptr;
     float *Xscale = nullptr, *Hscale = nullptr, *grp_tail = nullptr;   // NVFP4: activation scales, expert tails
     float* row_sd = nullptr;          // NVFP4 in MMQ: each Dm row's s_down, applied by the combine as it reads the row
@@ -1049,8 +1054,20 @@ bool fused_layout(size_t T, bool src) {
 // The MoE buffers MMQ and the fused path share: GU and H in floats, Xq and Hq in bytes.  Without `fused` (the
 // default): MMQ's, for T tokens.
 struct MoeBufs { size_t gu, h, xq, hq; };
+bool compact_mmq_enabled() {
+    static const bool on = [] { const char* e = std::getenv("STRATA_MMQ_COMPACT"); return e && e[0] == '1'; }();
+    // Full GU is still required by a non-MMQ expert or the fused-expert layout.
+    return on && mmq_plan().any && !mmq_plan().fallback && !fused_ring();
+}
+size_t compact_rows(size_t T) { return std::min(T * K, 2 * T); }
+size_t mmq_bounds_count(int64_t experts) {
+    return compact_mmq_enabled() ? (size_t)(3 * experts + 2) : (size_t)(2 * (experts + experts / MMQ_GROUP + 2));
+}
 MoeBufs moe_bufs(size_t T, int64_t n_expert, bool fused) {
-    if (!fused) return {T * K * 1280, T * K * 640, mmq::q8_bytes((int64_t) (T * K), N), mmq::q8_bytes((int64_t) (T * K), 640)};
+    if (!fused) {
+        const size_t rows = compact_mmq_enabled() ? compact_rows(T) : T * K;
+        return {rows * 1280, rows * 640, mmq::q8_bytes((int64_t) (T * K), N), mmq::q8_bytes((int64_t) (T * K), 640)};
+    }
     const size_t ts = (size_t) std::min<int64_t>((int64_t) T, stream_all_min() - 1);   // MMQ's last small chunk
     return {std::max<size_t>(ts * K * 1280, (fused::group_bytes((int64_t) (T * K), (int) n_expert) + 3) / 4),
             std::max<size_t>(ts * K * 640, (fused::act_bytes((int64_t) (T * K), 640) + 3) / 4),
@@ -1091,6 +1108,13 @@ bool Prefill::init(const core::WeightTable& wt, const core::ModelGeometry& g, co
 #endif
     m.wt = &wt; m.g = &g; m.ss = &ss; m.src = src; m.cache = cache; m.host_res = host_res;
     m.T = chunk; m.cs = (cudaStream_t) stream; m.stats = &stats_;
+    if (compact_mmq_enabled()) {
+        if (next_ || helper_ || m.pp || core::peer_portable()) {
+            err = "prefill: experimental compact MMQ currently supports a single GPU without helpers"; return false;
+        }
+        std::fprintf(stderr, "prefill: STRATA_MMQ_COMPACT on; GU/H capacity %zu rows (full %zu), router-order combine unchanged\n",
+                     compact_rows((size_t)chunk), (size_t)chunk*K);
+    }
     if (g.n_embd != N || g.hc != HC || g.hc_lr != LR || g.n_expert < 1 || ss.k != K) {
         err = "prefill: geometry differs from the artifact's"; return false;
     }
@@ -1165,7 +1189,7 @@ bool Prefill::init(const core::WeightTable& wt, const core::ModelGeometry& g, co
     m.steps_up.init(T * strata::kernels::kStepCount);
     m.ids_host.resize(T * K); m.slot_host.resize(T * K); m.src_host.resize(T * K); m.cnt.resize(m.g->n_expert); m.off.resize(m.g->n_expert + 1);
     {
-        const size_t need = 3 * T * K + (size_t) (2 * (m.g->n_expert + m.g->n_expert / MMQ_GROUP + 2));
+        const size_t need = 3 * T * K + mmq_bounds_count(m.g->n_expert);
         const char* gc = std::getenv("STRATA_GROUP_COPY");
         if (m.grp_n < need && !(gc && gc[0] == '1')) {
             if (m.grp_host) cudaFreeHost(m.grp_host);
@@ -1265,6 +1289,7 @@ bool Prefill::carve(size_t T, void* alloc) {
         const bool fz = fused_layout(T, m.src != nullptr);
         m.fused_bufs = fz;
         const MoeBufs mb = moe_bufs(T, m.g->n_expert, fz);
+        m.compact_mmq = compact_mmq_enabled() && !fz;
         const uint64_t region = std::max({gdn_set_bytes(T), qsa_set_bytes(T, m.cap, m.max_blocks, m.sel_batch,
                                                                            m.attn_batch, s), moe_set_bytes(T, m.g->n_expert, fz)});
         uint8_t* base = o.take<uint8_t>((size_t) region, ok);
@@ -1308,7 +1333,8 @@ bool Prefill::carve(size_t T, void* alloc) {
     if (mmq_plan().any) {
         const MmqPlan& mp = mmq_plan();
         m.ids_identity = o.take<int32_t>(T * K, ok);
-        m.bounds_dev = o.take<int32_t>((size_t) (2 * (m.g->n_expert + m.g->n_expert / MMQ_GROUP + 2)), ok);
+        m.compact_gu_ids = m.compact_mmq ? o.take<int32_t>(T * K, ok) : nullptr;
+        m.bounds_dev = o.take<int32_t>(mmq_bounds_count(m.g->n_expert), ok);
         m.grp_gu = o.take<uint8_t>(MMQ_GROUP * mp.gu_max + MMQ_TAIL, ok);
         m.grp_d = o.take<uint8_t>(MMQ_GROUP * mp.d_max + MMQ_TAIL, ok);
         // (written at every run's start, not here: when serving, these are live expert-cache slots until a request
@@ -1915,7 +1941,8 @@ uint64_t Prefill::bytes_needed_impl(const core::ModelGeometry& g, const core::Se
     if (mmq_plan().any) {
         const MmqPlan& mp = mmq_plan();
         o.take<int32_t>(T * K, ok);
-        o.take<int32_t>((size_t) (2 * (g.n_expert + g.n_expert / MMQ_GROUP + 2)), ok);
+        if (compact_mmq_enabled()) o.take<int32_t>(T * K, ok);
+        o.take<int32_t>(mmq_bounds_count(g.n_expert), ok);
         o.take<uint8_t>(MMQ_GROUP * mp.gu_max + MMQ_TAIL, ok);
         o.take<uint8_t>(MMQ_GROUP * mp.d_max + MMQ_TAIL, ok);
     }
@@ -3465,6 +3492,16 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                                 for (size_t i = 0; i <= MMQ_GROUP; ++i)
                                     m.bounds_host[n + 1 + g * (MMQ_GROUP + 1) + i] =
                                         m.bounds_host[std::min(n, g * MMQ_GROUP + i)] - m.bounds_host[g * MMQ_GROUP];
+                            if (m.compact_mmq) {
+                                const std::vector<int32_t> absolute(m.bounds_host.begin(), m.bounds_host.begin() + n + 1);
+                                if (!compact::plan(absolute, n, MMQ_GROUP, (int64_t)compact_rows((size_t)T),
+                                                   m.bounds_host, m.compact_gu_host, m.compact_groups)) {
+                                    err = "prefill: compact MMQ routing exceeded the bounded scratch"; return false;
+                                }
+                                if (m.up_ring.h2d(m.compact_gu_ids, m.compact_gu_host.data(), m.compact_gu_host.size()*4, m.cs) != cudaSuccess) {
+                                    err = "prefill: compact MMQ row-map upload failed"; return false;
+                                }
+                            }
                             if (grp_mapped) {
                                 int32_t* bh = m.grp_host + 3 * m.grp_tk;
                                 std::memcpy(bh, m.bounds_host.data(), m.bounds_host.size() * 4);
@@ -3900,6 +3937,40 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                                 if (q + 1 < MMQ_GROUP && j + 1 < order.size()) return true;
                                 // the group's products: gate/up, swiglu, the group's H to q8_1, down
                                 const size_t j0 = j - q, g = j0 / MMQ_GROUP, n = order.size();
+                                if (m.compact_mmq) {
+                                    // The gathered weights stay in their original 16-expert slots.
+                                    // Only GU/H addressing changes; Dm and final router-order combine stay intact.
+                                    for (const auto& sub : m.compact_groups) {
+                                        if (sub.first < j0 || sub.first > j) continue;
+                                        const size_t q0 = sub.first-j0;
+                                        const int nn = (int)(sub.end-sub.first);
+                                        int64_t max_rows = 0;
+                                        for (size_t e0=sub.first;e0<sub.end;++e0)
+                                            max_rows=std::max<int64_t>(max_rows,m.cnt[(size_t)order[e0]]);
+                                        mmq::Product gu;
+                                        gu.w=m.grp_gu+q0*mmq_gub; gu.type=mmq_gt;
+                                        gu.w_rows=1280; gu.w_cols=N; gu.expert_bytes=mmq_gub; gu.n=nn;
+                                        gu.xq=m.Xq; gu.bounds=m.bounds_dev+sub.first; gu.ids=m.compact_gu_ids;
+                                        gu.total_rows=T*K; gu.max_rows=max_rows; gu.dst=m.GU; gu.ld_dst=1280;
+                                        gu.y_scale=mmq::fp4_activations(mmq_gt)?m.Xscale:nullptr;
+                                        pt.mark(kPfGemmGU,cs); m.mmq_ctx->run(gu,m.cs);
+                                        if (lay.native && lay.fmt[(size_t)l].tail_off)
+                                            mmq::swiglu_scaled(m.GU,m.H,sub.rows,640,gu.bounds,nn,m.grp_tail+q0*4,sub.row0,m.cs);
+                                        else mmq::swiglu(m.GU,m.H,sub.rows,640,!lay.native,m.cs);
+                                        pt.mark(kPfGemmD,cs);
+                                        mmq::quantize(m.H,nullptr,m.Hq,mmq_dt,640,640,sub.rows,m.cs,m.Hscale);
+                                        mmq::Product dn;
+                                        dn.w=m.grp_d+q0*mmq_db; dn.type=mmq_dt;
+                                        dn.w_rows=N; dn.w_cols=640; dn.expert_bytes=mmq_db; dn.n=nn;
+                                        dn.xq=m.Hq; dn.bounds=m.bounds_dev+sub.relative_bounds; dn.ids=m.ids_identity;
+                                        dn.total_rows=sub.rows; dn.max_rows=max_rows; dn.dst=m.Dm+sub.row0*N; dn.ld_dst=N;
+                                        dn.y_scale=mmq::fp4_activations(mmq_dt)?m.Hscale:nullptr;
+                                        m.mmq_ctx->run(dn,m.cs);
+                                        if (lay.native && lay.fmt[(size_t)l].tail_off)
+                                            mmq::down_row_scales(m.row_sd+sub.row0,dn.bounds,nn,m.grp_tail+q0*4,sub.rows,m.cs);
+                                    }
+                                    return true;
+                                }
                                 const int ngx = (int) (q + 1);
                                 const int64_t r0 = m.bounds_host[j0], nr = m.bounds_host[j + 1] - r0;
                                 int64_t maxr = 0;

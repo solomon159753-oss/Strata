@@ -13,6 +13,7 @@
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
 #include <random>
 #include <vector>
 
@@ -49,6 +50,16 @@ int main(int argc, char** argv) {
     for (auto& x : dead) x = nd(rng);
     for (int64_t i = 0; i < nq; ++i)
         for (int d = 0; d < 512; ++d) q[(size_t) (i * 512 + d)] = 0.2f * dir[d % 128] + 0.1f * nd(rng);
+    // Optional adversarial test data only; production scorer arithmetic is unchanged.
+    const char* scenario = std::getenv("STRATA_SELECT_TEST_SCENARIO");
+    const bool exact_ties = scenario && !std::strcmp(scenario,"ties");
+    const bool near_ties = scenario && !std::strcmp(scenario,"near-ties");
+    if (exact_ties || near_ties) {
+        for (int64_t b = 0; b < max_blocks; ++b)
+            for (int d = 0; d < 128; ++d)
+                pooled[(size_t)(b*128+d)] = dir[d] * (1.f + (near_ties ? (float)((b%17)-8)*1e-7f : 0.f));
+        std::printf("scenario: %s (FP32 ties / close scores)\n",scenario);
+    }
     std::vector<int32_t> steps((size_t) (nq * k::kStepCount));
     for (int64_t i = 0; i < nq; ++i) {   // qsa_step_fill's arithmetic (kept here so the bench links only qsa_select)
         int32_t* st = steps.data() + i * k::kStepCount;
@@ -173,5 +184,5 @@ int main(int argc, char** argv) {
                 "mean %.2g max %.2g; selections identical %lld/%lld, cells differing %.4f%%\n", (long long) ctx,
                 (long long) nq, (long long) active, t_old, t_new, t_old / t_new, t_tk, sum_rel / std::max(1.0, n_rel),
                 max_rel, (long long) same_sel, (long long) nq, cells_all ? 100.0 * (double) cells_diff / (double) cells_all : 0.0);
-    return acc_ok && reg_same == nq ? 0 : 1;
+    return acc_ok && reg_same == nq && (!exact_ties || same_sel == nq) ? 0 : 1;
 }
