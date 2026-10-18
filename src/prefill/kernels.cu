@@ -1623,6 +1623,24 @@ __global__ void moe_combine4_kernel(const float* __restrict__ Dm, const int32_t*
     bo[i] = make_float4(s.x + sh.x * g, s.y + sh.y * g, s.z + sh.z * g, s.w + sh.w * g);
 }
 
+__global__ void moe_shared_init_kernel(const float* __restrict__ shared, const float* __restrict__ sg,
+                                       float* __restrict__ acc, int64_t T) {
+    const int64_t i = (int64_t) blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= T * N) return;
+    acc[i] = shared[i] * sigm(sg[i / N]);
+}
+// grid (n_u, ceil(N / 256)): one token of the group per block row, its rows summed in order
+__global__ void moe_scatter_add_kernel(const float* __restrict__ Dm, const int32_t* __restrict__ u_tok,
+                                       const int32_t* __restrict__ u_off, const int32_t* __restrict__ u_rows,
+                                       const float* __restrict__ u_w, float* __restrict__ acc) {
+    const int64_t u = blockIdx.x;
+    const int64_t d = (int64_t) blockIdx.y * blockDim.x + threadIdx.x;
+    if (d >= N) return;
+    float s = 0.0f;
+    for (int32_t j = u_off[u]; j < u_off[u + 1]; ++j) s = fmaf(u_w[j], Dm[(int64_t) u_rows[j] * N + d], s);
+    acc[(int64_t) u_tok[u] * N + d] += s;
+}
+
 // ---------------------------------------------------------------- QSA helpers
 __global__ void rms_rows_kernel(float* __restrict__ x, const float* __restrict__ w, int64_t cols, int64_t ld, float eps) {
     __shared__ float sh[32];
@@ -1669,6 +1687,48 @@ __global__ void gate_attn_kernel(const float* __restrict__ a, const float* __res
     if (i >= T * 24 * 256) return;
     const int64_t t = i / (24 * 256), h = (i / 256) % 24, d = i % 256;
     o16[t * ld16 + h * 256 + d] = hf(a[i] * (1.0f / (1.0f + expf(-qf[t * 24 * 512 + h * 512 + 256 + d]))));
+}
+
+// split_q_kernel, rms_rows_kernel and rope_kernel (the first 64 of the 256 values) in one block per (token, head)
+// row: the norm reads q_full's row directly (no split copy) and the rotation rereads the 64 values it turns from the
+// row it just wrote, as rope_kernel does.  The loops keep rms_rows_kernel's and rope_kernel's shapes (a version with
+// the row in registers and a constant 256 gave other bits in ~5% of the rows; the cause was not isolated).
+// hip_prefill_q_prep checks it against the three kernels bit for bit.
+template <bool TAB>
+__global__ void __launch_bounds__(256) q_prep_kernel(const float* __restrict__ qf, const float* __restrict__ w,
+                                                     float* __restrict__ q, int64_t cols, float eps, int64_t pos0,
+                                                     float theta_scale, float freq_scale, float corr_low,
+                                                     float corr_high, float ext_factor, float mscale,
+                                                     const int32_t* __restrict__ mtab, strata::kernels::RopeTab rt) {
+    __shared__ float sh[32];
+    const int64_t row = blockIdx.x;             // t * 24 + h
+    const int64_t t = row / 24, h = row % 24;
+    const float* in = qf + t * 24 * 512 + h * 512;
+    float* r = q + row * 256;
+    // rms_rows_kernel's loops (the row read from q_full instead of the split copy), the same expressions in the same
+    // shape
+    float ss = 0.0f;
+    for (int64_t c = threadIdx.x; c < cols; c += blockDim.x) ss += in[c] * in[c];
+    const float s = rsqrtf(block_sum(ss, sh) / (float) cols + eps);
+    __syncthreads();
+    for (int64_t c = threadIdx.x; c < cols; c += blockDim.x) r[c] = s * in[c] * w[c];
+    __syncthreads();   // the row's normed values are visible to the block before the rotation reads them
+    // rope_kernel's body for this row: threads 0-31 are its pairs
+    if (threadIdx.x < 32) {
+        const int pair = threadIdx.x;
+        float* p = r;
+        float c, sn;
+        if (!(TAB && strata::kernels::rope_tab_cs(rt, strata::kernels::mrope_pos(mtab, (int) (pos0 + t), pair), pair, c,
+                                                  sn))) {
+            const float theta_extrap =
+                (float) strata::kernels::mrope_pos(mtab, (int) (pos0 + t), pair) * powf(theta_scale, (float) pair);
+            strata::kernels::rope_scaled_angle(theta_extrap, freq_scale, corr_low, corr_high, ext_factor, mscale,
+                                               pair, c, sn);
+        }
+        const float a = p[pair], b = p[pair + 32];
+        p[pair] = a * c - b * sn;
+        p[pair + 32] = a * sn + b * c;
+    }
 }
 
 // one block per (token, kv head, 64-value group); 64 threads. KV streaming: the pool page only if the block is
@@ -2186,6 +2246,18 @@ void moe_combine(const float* Dm, const int32_t* slot, const float* w, const flo
     moe_combine_kernel<<<blocks_for(T * N), 256, 0, (cudaStream_t) stream>>>(Dm, slot, w, shared, sg, bo, T, row_sd);
     check("moe_combine");
 }
+void moe_shared_init(const float* shared, const float* sg, float* acc, int64_t T, void* stream) {
+    if (T <= 0) return;
+    moe_shared_init_kernel<<<blocks_for(T * N), 256, 0, (cudaStream_t) stream>>>(shared, sg, acc, T);
+    check("moe_shared_init");
+}
+void moe_scatter_add(const float* Dm, const int32_t* u_tok, const int32_t* u_off, const int32_t* u_rows,
+                     const float* u_w, int64_t n_u, float* acc, void* stream) {
+    if (n_u <= 0) return;
+    const dim3 grid((unsigned) n_u, (unsigned) ((N + 255) / 256));
+    moe_scatter_add_kernel<<<grid, 256, 0, (cudaStream_t) stream>>>(Dm, u_tok, u_off, u_rows, u_w, acc);
+    check("moe_scatter_add");
+}
 void rms_rows(float* x, const float* w, int64_t rows, int64_t cols, int64_t ld, float eps, void* stream) {
     if (rows <= 0) return;
     rms_rows_kernel<<<(unsigned) rows, 256, 0, (cudaStream_t) stream>>>(x, w, cols, ld, eps);
@@ -2215,6 +2287,26 @@ void rope(float* x, int64_t T, int64_t heads, int64_t dim, int64_t ld, int64_t p
 void split_q(const float* q_full, float* q, int64_t T, void* stream) {
     split_q_kernel<<<blocks_for(T * 24 * 256), 256, 0, (cudaStream_t) stream>>>(q_full, q, T);
     check("split_q");
+}
+void q_prep(const float* q_full, const float* w, float* q, int64_t T, float eps, int64_t pos0,
+            const strata::kernels::RopeScaling& scaling, void* stream) {
+    if (T <= 0) return;
+    if (const char* why = strata::kernels::rope_scaling_invalid(scaling)) {   // rope()'s check
+        std::fprintf(stderr, "prefill q_prep: invalid rope scaling: %s\n", why);
+        std::exit(1);
+    }
+    const float theta_scale = powf((float) scaling.freq_base, -2.0f / 64.0f);
+    const strata::kernels::RopeKernelArgs k = scaling.kernel_args(64);
+    const strata::kernels::RopeTab rt = strata::kernels::rope_table_for(scaling);
+    if (rt.cos != nullptr)
+        q_prep_kernel<true><<<(unsigned) (T * 24), 256, 0, (cudaStream_t) stream>>>(
+            q_full, w, q, 256, eps, pos0, theta_scale, k.freq_scale, k.corr_low, k.corr_high, k.ext_factor, k.attn_factor,
+            strata::kernels::mrope_table(), rt);
+    else
+        q_prep_kernel<false><<<(unsigned) (T * 24), 256, 0, (cudaStream_t) stream>>>(
+            q_full, w, q, 256, eps, pos0, theta_scale, k.freq_scale, k.corr_low, k.corr_high, k.ext_factor, k.attn_factor,
+            strata::kernels::mrope_table(), rt);
+    check("q_prep");
 }
 void gate_attn(const float* attn, const float* q_full, uint16_t* out16, int64_t T, void* stream, int64_t ld16) {
     gate_attn_kernel<<<blocks_for(T * 24 * 256), 256, 0, (cudaStream_t) stream>>>(attn, q_full, out16, T,

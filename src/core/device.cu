@@ -200,6 +200,12 @@ hipError_t mem_get_info(size_t* free_bytes, size_t* total_bytes) {
         local.Budget == 0 || local.Budget >= *total_bytes)
         return e;
     const size_t withheld = *total_bytes - (size_t) local.Budget;   // the desktop's and other programs' share
+    if (std::getenv("STRATA_DBG_MEMORY_BUDGET")) {
+        std::fprintf(stderr, "strata memory budget: HIP free %llu MiB, total %llu MiB, DXGI budget %llu MiB, usage %llu MiB, withheld %llu MiB\n",
+                     (unsigned long long) (*free_bytes >> 20), (unsigned long long) (*total_bytes >> 20),
+                     (unsigned long long) (local.Budget >> 20), (unsigned long long) (local.CurrentUsage >> 20),
+                     (unsigned long long) (withheld >> 20));
+    }
     static std::atomic<bool> said{false};
     if (!said.exchange(true)) {
         std::fprintf(stderr, "strata: Windows budgets %llu of this card's %llu MiB for this process; free VRAM is "
