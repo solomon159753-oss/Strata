@@ -27,6 +27,9 @@ namespace strata::kernels::cpu { class ExpertPool; }
 
 namespace strata::prefill {
 
+void r6_heat_reset(int64_t layers, int64_t experts, int64_t cutoff);
+const std::vector<float>& r6_heat_get();
+
 struct PrefillStats {
     int64_t tokens = 0;
     int64_t chunks = 0;

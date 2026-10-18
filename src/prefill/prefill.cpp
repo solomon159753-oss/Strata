@@ -114,6 +114,18 @@ bool prompt_run(const int64_t* tokens, int64_t n, int64_t pos0, const float* con
 
 namespace strata::prefill {
 namespace {
+thread_local std::vector<float> r6_heat;
+thread_local int64_t r6_cutoff = 0;
+}
+void r6_heat_reset(int64_t layers, int64_t experts, int64_t cutoff) {
+    r6_cutoff = cutoff;
+    const char* mode = std::getenv("STRATA_R6_PROMPT_HEAT");
+    if (mode && std::atoi(mode) > 0) r6_heat.assign((size_t)(layers * experts), 0.0f);
+    else r6_heat.clear();
+}
+const std::vector<float>& r6_heat_get() { return r6_heat; }
+
+namespace {
 
 using Clock = std::chrono::steady_clock;
 constexpr float EPS = 1e-6f;
@@ -4895,7 +4907,7 @@ bool Prefill::run_layer_major(const int64_t* tokens, int64_t n, int64_t pos0, st
     const int64_t G = compact_mmq_enabled() ? (int64_t) compact_rows(m.T) : m.T * K;   // the MoE buffers' rows (Xq, GU, H, Hq, Dm): a group's most
 
     // ---- one layer's experts over the super-chunk's Sn tokens
-    auto lm_experts = [&](int64_t l, int64_t Sn) -> bool {
+    auto lm_experts = [&](int64_t l, int64_t Sn, int64_t absolute_start) -> bool {
         const auto th0 = Clock::now();
         const int64_t rows = Sn * K;
         int32_t* idsw = lb.idsw_host;
@@ -4917,6 +4929,8 @@ bool Prefill::run_layer_major(const int64_t* tokens, int64_t n, int64_t pos0, st
             const int32_t e = ids_h[(size_t) i];
             if (e < 0 || e >= NE) { err = "prefill (layer-major): routed id out of range"; return false; }
             ++cnt[(size_t) e];
+            if (!r6_heat.empty() && absolute_start + i / K >= r6_cutoff)
+                r6_heat[(size_t)l * NE + e] += 1.0f;
         }
         for (int32_t e = 0; e < NE; ++e) off[(size_t) e + 1] = off[(size_t) e] + cnt[(size_t) e];
         // ---- the routed experts in id order: resident ones from the cache, the others staged once (run_impl's walk)
@@ -5601,7 +5615,7 @@ bool Prefill::run_layer_major(const int64_t* tokens, int64_t n, int64_t pos0, st
             }
             ms_attn += ms_since(ta);
             if (l == L) break;
-            if (!lm_experts(l, Sn)) return false;
+            if (!lm_experts(l, Sn, pos0 + sc0)) return false;
         }
     }
     lm_mid_ = false;

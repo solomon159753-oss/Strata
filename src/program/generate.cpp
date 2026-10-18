@@ -11702,6 +11702,11 @@ int main(int argc, char** argv) {
             if (pipe) ver_b.set_history(hist_n > 0 ? d_hist : nullptr, hist_n);
             bool cancelled = false;
             tr("prompt start", n - 1);
+            const char* r6hm = std::getenv("STRATA_R6_PROMPT_HEAT");
+            const int r6_heat_mode = r6hm ? std::atoi(r6hm) : 0;
+            strata::prefill::r6_heat_reset(g.n_layers, g.n_expert,
+                r6_heat_mode == 2 ? std::max<int64_t>(0, n - 1 - 2048) : 0);
+
             // The prompt is read in two parts when it has a turn boundary past `resume`: up to the last <|im_start|>
             // (the conversation so far), a checkpoint there, then the new turn's header.  The next request of the same
             // chat renders the same history - but not always the same header or the thinking of this reply - so that
@@ -11844,6 +11849,18 @@ int main(int argc, char** argv) {
                 std::fprintf(stderr, "strata serve: --prefill-head-alias: output head restored in %.1f ms before decode\n",
                              std::chrono::duration<double, std::milli>(Clock::now() - head_t0).count());
             }
+
+            if (r6_heat_mode > 0 && !drive.d.usage.empty() && !cancelled && !ajob && !aov) {
+                const auto& hh = strata::prefill::r6_heat_get();
+                if (hh.size() == drive.d.usage.size()) {
+                    drive.d.usage = hh;
+                    if (!adapt()) { std::printf("ERR round6 prompt-heat adaptation failed\n"); return 1; }
+                    apply_pending(true); // Preserve existing event, exchange, lifetime and residency fences.
+                    std::fill(drive.d.usage.begin(), drive.d.usage.end(), 0.0f);
+                    std::fprintf(stderr, "strata R6 prompt heat: mode=%d, slots=%lld, swaps=%lld\n",
+                        r6_heat_mode, (long long)hh.size(), (long long)adapt_nswaps);
+                }
+            }
             tr("prompt done (slots refilled)");
             if (il_parts > 0)
                 std::fprintf(stderr, "strata batch: the prompt was read in %lld parts, the slots decoding %.0f ms between "
@@ -11870,6 +11887,11 @@ int main(int argc, char** argv) {
             }
             bool first_window = true;
             int64_t produced_n = 0, sfx_windows = 0, sfx_drafts = 0, sfx_ok = 0;
+            const char* r6dm = std::getenv("STRATA_R6_DYNAMIC_SPEC");
+            const bool r6_dynamic = r6dm && r6dm[0] == '1';
+            double r6_ms[2] = {}, r6_tok[2] = {};
+            int r6_count[2] = {}, r6_tick = 0, r6_pick = -1;
+
             int64_t chain_windows = 0, chain_drafts = 0, chain_ok = 0;   // --lookup-chain's own counts
             int64_t t2_rej[8] = {}, t2_hit[8] = {};   // STRATA_MTP_TOP2: rejections inside the MTP drafts by depth, runner-up hits
             int64_t dp_tested[8] = {}, dp_ok[8] = {};   // STRATA_SPEC_DEPTH=1: MTP drafts tested / accepted by depth
@@ -12459,7 +12481,10 @@ int main(int argc, char** argv) {
                     }
                     x = outp[(size_t) a];
                     p = A.p + a + 1;
-                    pcie_auto_step(req_pcie_frac);   // 0.1.44: the measured share in the pipelined loop too (STRATA_PCIE_AUTO_SPLIT=1 on a split)
+                    if (r6_dynamic && (produced_n >= max_new || eos))
+                    std::fprintf(stderr, "strata R6 dynamic: spec3=%d spec4=%d, tok/ms %.6f %.6f\n",
+                        r6_count[0], r6_count[1], r6_tok[0]/std::max(0.001,r6_ms[0]), r6_tok[1]/std::max(0.001,r6_ms[1]));
+                pcie_auto_step(req_pcie_frac);   // 0.1.44: the measured share in the pipelined loop too (STRATA_PCIE_AUTO_SPLIT=1 on a split)
                     if (!last && !ajob && !pl_adapt()) return die("an adaptive refill failed");
                     if (on && !last) {
                         ++pl_on;
@@ -12571,6 +12596,15 @@ int main(int argc, char** argv) {
                     while (T < S_mtp && dprob[(size_t) T - 1] >= (float) req_spec_min_p) ++T;
                 }
                 if (first_window) T = 1;
+                r6_pick = -1;
+                if (r6_dynamic && use_mtp && !first_window && T >= 3 && S_mtp == 4) {
+                    int pick = r6_count[0] < 2 ? 0 : r6_count[1] < 2 ? 1
+                        : (r6_tok[1] / r6_ms[1] > r6_tok[0] / r6_ms[0] ? 1 : 0);
+                    if (++r6_tick % 8 == 0 && r6_count[0] >= 2 && r6_count[1] >= 2) pick = 1 - pick;
+                    T = std::min(T, pick + 3);
+                    if (T == pick + 3) r6_pick = pick;
+                }
+
                 // a repeat of earlier context (prompt lookup) where the MTP's own first guess agrees: the policy takes it
                 // when its expected tokens per ms, from the measured acceptance and window costs, beat the MTP window's
                 bool from_sfx = false;
@@ -12734,6 +12768,12 @@ int main(int argc, char** argv) {
                     const Clock::time_point tw3 = Clock::now();
                     auto msd = [](Clock::time_point a0, Clock::time_point b0) { return std::chrono::duration<double, std::milli>(b0 - a0).count(); };
                     dt_run += msd(tw0, tw1); dt_commit += msd(tw1, tw2); dt_draft += msd(tw2, tw3);
+                    if (r6_pick >= 0 && !from_sfx) {
+                        r6_ms[r6_pick] += std::max(0.001, msd(tw0, tw3));
+                        r6_tok[r6_pick] += a + 1;
+                        ++r6_count[r6_pick];
+                    }
+
                     ++dec_windows; dec_T += T;
                 }
                 pcie_auto_step(req_pcie_frac);   // the default share, refined from the CPU pool's speed (PcieAuto); a request's own share is left alone
