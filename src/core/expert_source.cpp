@@ -1,3 +1,5 @@
+#include <functional>
+#include <exception>
 // src/core/expert_source.cpp - the adapter.  See the header for the three clauses of the contract.
 #include "strata/core/expert_source.hpp"
 #include "strata/core/foresight_swap.hpp"
@@ -1535,6 +1537,44 @@ bool FileExpertSource::advise_pairs(const std::pair<int32_t, int32_t>* pairs, in
     return true;
 }
 
+
+// R5: opt-in persistent host fetch team. A batch drains all workers before
+// returning, including exceptions; source/staging pointers never outlive a batch.
+namespace {
+bool r5_fetch_team_on() {
+ static const bool on=[] {const char* v=std::getenv("STRATA_R5_FETCH_TEAM");return v && v[0]=='1';}();
+ return on;
+}
+class R5FetchWorker {
+ std::mutex m_;std::condition_variable cv_;std::function<void()> fn_;
+ bool pending_=false,done_=true,stop_=false;std::exception_ptr error_;std::thread th_;
+ void loop() {
+  for(;;) {
+   std::unique_lock<std::mutex> l(m_);cv_.wait(l,[&]{return pending_||stop_;});
+   if(stop_&&!pending_)return;
+   auto fn=std::move(fn_);pending_=false;l.unlock();
+   std::exception_ptr err;try{fn();}catch(...){err=std::current_exception();}
+   l.lock();error_=err;done_=true;l.unlock();cv_.notify_all();
+  }
+ }
+public:
+ R5FetchWorker():th_([this]{loop();}){}
+ ~R5FetchWorker(){wait_no_throw();{std::lock_guard<std::mutex> l(m_);stop_=true;}cv_.notify_all();th_.join();}
+ void submit(const std::function<void()>& fn){std::lock_guard<std::mutex> l(m_);if(!done_)throw std::logic_error("fetch worker busy");fn_=fn;error_=nullptr;done_=false;pending_=true;cv_.notify_one();}
+ std::exception_ptr wait_no_throw(){std::unique_lock<std::mutex> l(m_);cv_.wait(l,[&]{return done_;});return error_;}
+};
+void r5_fetch_team(size_t n,const std::function<void()>& work) {
+ static thread_local std::vector<std::unique_ptr<R5FetchWorker>> team;
+ while(team.size()+1<n)team.push_back(std::make_unique<R5FetchWorker>());
+ size_t sent=0;std::exception_ptr err;
+ try{for(;sent+1<n;++sent)team[sent]->submit(work);work();}catch(...){err=std::current_exception();}
+ for(size_t j=0;j<sent;++j){auto e=team[j]->wait_no_throw();if(!err)err=e;}
+ if(err)std::rethrow_exception(err);
+ static thread_local bool printed=false;
+ if(!printed){std::fprintf(stderr,"strata R5 fetch team: active, persistent workers, batch drained\n");printed=true;}
+}
+}
+
 void FileExpertSource::fill_many(const std::vector<Fill>& todo) {
     if (todo.empty()) return;
     if (!direct_.empty()) {
@@ -1556,6 +1596,7 @@ void FileExpertSource::fill_many(const std::vector<Fill>& todo) {
             }
         };
         const size_t nt = std::min<size_t>(4, (todo.size() + 15) / 16);
+        if(r5_fetch_team_on()){r5_fetch_team(nt,work);return;}
         std::vector<std::thread> th;
         for (size_t t = 1; t < nt; ++t) th.emplace_back(work);
         work();
@@ -1593,6 +1634,7 @@ void FileExpertSource::fill_many(const std::vector<Fill>& todo) {
             (void) fill_stage(todo[i].v, todo[i].layer, todo[i].e, todo[i].dst);
     };
     const size_t nt = std::min<size_t>(todo.size(), (size_t) fetch_threads_);
+    if(r5_fetch_team_on()){r5_fetch_team(std::max<size_t>(nt,1),work);return;}
     std::vector<std::thread> th;
     for (size_t t = 1; t < nt; ++t) th.emplace_back(work);
     work();
